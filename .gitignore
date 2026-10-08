@@ -1,0 +1,12 @@
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+
+# Локальные настройки и секреты (Wi-Fi, MQTT)
+include/secrets.h
+
+# Системные и временные файлы
+.DS_Store
+__pycache__/
+*.pyc
