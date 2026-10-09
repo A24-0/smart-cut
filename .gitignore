@@ -5,6 +5,12 @@
 
 # Локальные настройки и секреты (Wi-Fi, MQTT)
 include/secrets.h
+cam/include/secrets.h
+
+# Локальный сервер: база, ключ подписи, загруженные картинки
+server/smartcut.db
+server/.secret
+server/images/
 
 # Системные и временные файлы
 .DS_Store

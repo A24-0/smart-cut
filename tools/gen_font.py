@@ -1,4 +1,4 @@
-# Генератор GFX-шрифта с кириллицей из Arial Bold (запуск: python3 tools/gen_font.py)
+# генерирует include/font_ru.h из Arial Bold
 from PIL import Image, ImageDraw, ImageFont
 
 TTF = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
@@ -44,6 +44,6 @@ def build(name, size):
     return "\n".join(out)
 
 with open("include/font_ru.h", "w") as f:
-    f.write("#pragma once\n// Сгенерировано tools/gen_font.py (Arial Bold, ASCII + кириллица)\n#include <Arduino.h>\n#include <gfxfont.h>\n\n")
+    f.write("#pragma once\n// сгенерировано tools/gen_font.py\n#include <Arduino.h>\n#include <gfxfont.h>\n\n")
     f.write(build("FontRu20", 20) + "\n\n")
     f.write(build("FontRu30", 30) + "\n")

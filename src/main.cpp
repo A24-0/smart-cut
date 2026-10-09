@@ -2,7 +2,10 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <WiFiManager.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <esp_timer.h>
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -12,27 +15,30 @@
 
 TFT_eSPI tft;
 
-// ---------------- Настройки цикла нарезки ----------------
-#define CONVEYOR_LOOP_MS 5000   // время одного полного круга конвейера, мс
-#define CONVEYOR_SPEED 165      // скорость конвейера 0..255 (меньше = медленнее)
-#define SCREW_STEPS 90000       // шагов ШВП от верха до низа (ход 30 см)
-#define SCREW_DOWN_DIR -1       // 1 или -1: если ШВП едет не туда, поменять знак
-#define STEP_DELAY_US 400       // пауза между шагами ШВП: меньше = быстрее
+// параметры цикла
+#define CONVEYOR_LOOP_MS 5000    // один круг конвейера, мс
+#define CONVEYOR_SPEED 165       // 0..255
+#define SCREW_STEPS 81000        // шагов от верха до низа
+#define SCREW_DOWN_DIR -1        // 1 или -1
+#define MANUAL_JOG 1             // кнопки «Вверх»/«Вниз» на экране
+#define START_DELAY_US 3000      // пауза между шагами на старте, мкс
+#define RAMP_STEPS 1200          // шагов разгона и торможения
+#define STEP_DELAY_US 600        // пауза между шагами, мкс
 
-// ---------------- Пины ----------------
-// Конвейер: L298N
+// Пины
+// конвейер (L298N)
 #define ENA 15
 #define IN1 2
 #define IN2 4
 #define IN3 16
 #define IN4 17
 #define ENB 5
-// ШВП: NEMA 17 (A+, A-, B+, B-)
+// ШВП (NEMA 17)
 #define ST1 13
 #define ST2 12
 #define ST3 14
 #define ST4 27
-// Тач XPT2046 (программный SPI)
+// тач XPT2046
 #define T_CLK 19
 #define T_CS 21
 #define T_DIN 22
@@ -46,21 +52,30 @@ const uint8_t stepSeq[4][4] = {
   {1, 0, 0, 1},
 };
 
-// ---------------- Состояние цикла ----------------
-enum Stage { IDLE, WAIT_CONFIRM, CONVEYOR, SCREW_DOWN, SCREW_UP, DONE };
+// Состояние цикла
+enum Stage { IDLE, WAIT_CONFIRM, CONVEYOR, SCREW_DOWN, SCREW_UP, DONE, RETURN_HOME };
 Stage stage = IDLE;
 uint32_t stageStart = 0;
-long stepsLeft = 0;
-int screwDir = 1;
+volatile long stepsLeft = 0;
+volatile int screwDir = 1;
+
+// положение ШВП: шагов вниз от верха, хранится в памяти
+#define HOME_MARGIN_STEPS 500
+Preferences prefs;
+volatile long screwPos = 0;
+long homeTotal = 1;
 
 String stepProduct, stepCut;
 int stepGrams = -1;
 bool stepAuto = false;
 
-// ---------------- MQTT ----------------
+// MQTT
+WiFiManager wm;
+bool portalMode = false;
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
-String topicCmd, topicStatus;
+String topicCmd, topicStatus, topicProduct;
+String detectedProduct;
 uint32_t lastStatus = 0, lastMqttTry = 0;
 
 const char* stateName() {
@@ -83,7 +98,7 @@ void publishStatus() {
   lastStatus = millis();
 }
 
-// ---------------- Моторы ----------------
+// Моторы
 void conveyorOn() {
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, HIGH);
@@ -109,20 +124,71 @@ void releaseScrew() {
   digitalWrite(ST4, LOW);
 }
 
-void stepMotor() {
+// шаги идут от таймера, чтобы экран и тач не сбивали ритм
+volatile long stepsDone = 0;
+volatile bool stepActive = false;
+portMUX_TYPE stepMux = portMUX_INITIALIZER_UNLOCKED;
+esp_timer_handle_t stepTimer;
+
+void onStepTimer(void*) {
   static uint8_t idx = 0;
-  static uint32_t last = 0;
-  if (stepsLeft <= 0 || micros() - last < STEP_DELAY_US) return;
-  last = micros();
+  static int lastDir = 0;
+  portENTER_CRITICAL(&stepMux);
+  long left = stepsLeft;
+  int dir = screwDir;
+  if (left <= 0) {
+    stepsDone = 0;
+    lastDir = 0;
+    stepActive = false;
+    portEXIT_CRITICAL(&stepMux);
+    releaseScrew();
+    return;
+  }
+  if (dir != lastDir) {
+    stepsDone = 0;
+    lastDir = dir;
+  }
+  idx = (idx + (dir > 0 ? 1 : 3)) & 3;
+  stepsLeft = left - 1;
+  stepsDone = stepsDone + 1;
+  long pos = screwPos + ((dir == SCREW_DOWN_DIR) ? 1 : -1);
+  screwPos = pos < 0 ? 0 : pos;
+  long n = min((long)stepsDone, left - 1);
+  portEXIT_CRITICAL(&stepMux);
+
   digitalWrite(ST1, stepSeq[idx][0]);
   digitalWrite(ST2, stepSeq[idx][1]);
   digitalWrite(ST3, stepSeq[idx][2]);
   digitalWrite(ST4, stepSeq[idx][3]);
-  idx = (idx + (screwDir > 0 ? 1 : 3)) % 4;
-  stepsLeft--;
+
+  uint32_t d = STEP_DELAY_US;
+  if (n < RAMP_STEPS) d += (RAMP_STEPS - n) * (START_DELAY_US - STEP_DELAY_US) / RAMP_STEPS;
+  esp_timer_start_once(stepTimer, d);
 }
 
-// ---------------- Тач ----------------
+void startMove(int dir, long steps) {
+  portENTER_CRITICAL(&stepMux);
+  screwDir = dir;
+  stepsLeft = steps;
+  bool kick = !stepActive;
+  stepActive = true;
+  portEXIT_CRITICAL(&stepMux);
+  if (kick) esp_timer_start_once(stepTimer, START_DELAY_US);
+}
+
+void savePos(bool moving) {
+  prefs.putLong("pos", screwPos);
+  prefs.putBool("moving", moving);
+}
+
+void loadPos() {
+  prefs.begin("cut", false);
+  screwPos = prefs.getLong("pos", 0);
+  // питание пропало в движении: считаем, что нож внизу
+  if (prefs.getBool("moving", false)) screwPos = SCREW_STEPS;
+}
+
+// Тач
 void drawText(const String& t, int x, int y, const GFXfont* f = &FontRu30);
 uint16_t xptRead(uint8_t cmd) {
   digitalWrite(T_CS, LOW);
@@ -148,7 +214,7 @@ bool readRaw(uint16_t* rx, uint16_t* ry) {
   if (xptRead(0xB0) < TOUCH_Z_MIN) return false;
   uint32_t ax = 0, ay = 0;
   for (int i = 0; i < 4; i++) {
-    xptRead(0xD0);  // первое измерение после смены канала выбрасываем
+    xptRead(0xD0);  // первое измерение отбрасываем
     ax += xptRead(0xD0);
     xptRead(0x90);
     ay += xptRead(0x90);
@@ -168,24 +234,53 @@ bool getTouchXY(uint16_t* x, uint16_t* y) {
   return true;
 }
 
+void saveCal() {
+  prefs.putBool("cal2_ok", true);
+  prefs.putBool("cal_swap", calSwap);
+  prefs.putFloat("cal_ux0", calUx0);
+  prefs.putFloat("cal_uk", calUk);
+  prefs.putFloat("cal_vy0", calVy0);
+  prefs.putFloat("cal_vk", calVk);
+}
+
+bool loadCal() {
+  if (!prefs.getBool("cal2_ok", false)) return false;
+  calSwap = prefs.getBool("cal_swap", false);
+  calUx0 = prefs.getFloat("cal_ux0", 0);
+  calUk = prefs.getFloat("cal_uk", 0);
+  calVy0 = prefs.getFloat("cal_vy0", 0);
+  calVk = prefs.getFloat("cal_vk", 0);
+  return calUk != 0 && calVk != 0;
+}
+
+// ждём, пока палец убран
+void waitRelease() {
+  uint16_t rx, ry;
+  uint32_t t = millis();
+  while (millis() - t < 300) {
+    if (readRaw(&rx, &ry)) t = millis();
+  }
+}
+
 void calPoint(int sx, int sy, float* ox, float* oy) {
-  tft.fillScreen(TFT_BLACK);
-  tft.drawFastHLine(sx - 15, sy, 31, TFT_WHITE);
-  tft.drawFastVLine(sx, sy - 15, 31, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE);
+  tft.fillScreen(tft.color565(238, 242, 248));
+  tft.drawFastHLine(sx - 15, sy, 31, tft.color565(25, 34, 56));
+  tft.drawFastVLine(sx, sy - 15, 31, tft.color565(25, 34, 56));
+  tft.setTextColor(tft.color565(25, 34, 56));
   tft.setTextDatum(MC_DATUM);
   drawText("Нажми на крестик", 240, 160);
+  waitRelease();
   uint16_t rx, ry;
   while (!readRaw(&rx, &ry)) {}
+  delay(150);
   float sumx = 0, sumy = 0; int n = 0;
   uint32_t t0 = millis();
-  while (millis() - t0 < 400) {
+  while (millis() - t0 < 350) {
     if (readRaw(&rx, &ry)) { sumx += rx; sumy += ry; n++; }
   }
   *ox = sumx / max(n, 1);
   *oy = sumy / max(n, 1);
-  while (readRaw(&rx, &ry)) {}
-  delay(300);
+  waitRelease();
 }
 
 void calibrateTouch() {
@@ -194,12 +289,11 @@ void calibrateTouch() {
     calPoint(30, 30, &x0, &y0);
     calPoint(450, 30, &x1, &y1);
     calPoint(30, 290, &x2, &y2);
-    Serial.printf("RAW p0=%.0f,%.0f p1=%.0f,%.0f p2=%.0f,%.0f\n", x0, y0, x1, y1, x2, y2);
     calSwap = fabsf(y1 - y0) > fabsf(x1 - x0);
     float u0 = calSwap ? y0 : x0, u1 = calSwap ? y1 : x1;
     float v0 = calSwap ? x0 : y0, v2 = calSwap ? x2 : y2;
-    if (fabsf(u1 - u0) < 800 || fabsf(v2 - v0) < 800) {  // нажатия слишком близко / не в крестики
-      tft.fillScreen(TFT_BLACK);
+    if (fabsf(u1 - u0) < 800 || fabsf(v2 - v0) < 800) {
+      tft.fillScreen(tft.color565(238, 242, 248));
       tft.setTextColor(TFT_RED);
       tft.setTextDatum(MC_DATUM);
       drawText("Ошибка. Повтори", 240, 160);
@@ -208,13 +302,29 @@ void calibrateTouch() {
     }
     calUx0 = u0; calUk = 420.0f / (u1 - u0);
     calVy0 = v0; calVk = 260.0f / (v2 - v0);
-    Serial.printf("CAL swap=%d uk=%.4f vk=%.4f\n", calSwap, calUk, calVk);
+    // проверка по четвёртой точке
+    float x3, y3;
+    calPoint(450, 290, &x3, &y3);
+    float pu = calSwap ? y3 : x3, pv = calSwap ? x3 : y3;
+    float sx = (pu - calUx0) * calUk + 30, sy = (pv - calVy0) * calVk + 30;
+    if (fabsf(sx - 450) > 45 || fabsf(sy - 290) > 45) {
+      tft.fillScreen(tft.color565(238, 242, 248));
+      tft.setTextColor(TFT_RED);
+      tft.setTextDatum(MC_DATUM);
+      drawText("Ошибка. Повтори", 240, 160);
+      delay(1500);
+      continue;
+    }
+    saveCal();
     return;
   }
 }
 
-// ---------------- Интерфейс ----------------
-void drawText(const String& t, int x, int y, const GFXfont* f) {
+// Интерфейс
+void drawText(const String& text, int x, int y, const GFXfont* f) {
+  String t = text;
+  t.replace("ё", "е");
+  t.replace("Ё", "Е");
   tft.setFreeFont(f);
   tft.drawString(t, x, y);
 }
@@ -222,18 +332,26 @@ void drawText(const String& t, int x, int y, const GFXfont* f) {
 struct Btn { int x, y, w, h; };
 const Btn btnStart = {16, 236, 300, 68};
 const Btn btnStop  = {332, 236, 132, 68};
+#if MANUAL_JOG
+const Btn btnUp   = {16, 184, 220, 40};
+const Btn btnDown = {244, 184, 220, 40};
+#endif
 
 #define C(r, g, b) tft.color565(r, g, b)
-const uint16_t COL_BG = C(10, 14, 26);
-const uint16_t COL_HEADER = C(20, 27, 46);
-const uint16_t COL_CARD = C(24, 32, 54);
-const uint16_t COL_PILL = C(38, 48, 74);
-const uint16_t COL_MUTED = C(130, 142, 170);
-const uint16_t COL_ACCENT = C(255, 145, 30);
-const uint16_t COL_BLUE = C(59, 130, 246);
-const uint16_t COL_CYAN = C(34, 211, 238);
-const uint16_t COL_GREEN = C(34, 197, 94);
-const uint16_t COL_RED = C(239, 68, 68);
+const uint16_t COL_BG = C(238, 242, 248);
+const uint16_t COL_HEADER = C(255, 255, 255);
+const uint16_t COL_CARD = C(255, 255, 255);
+const uint16_t COL_BORDER = C(210, 217, 230);
+const uint16_t COL_ICONBG = C(240, 244, 250);
+const uint16_t COL_PILL = C(224, 230, 240);
+const uint16_t COL_SHADOW = C(200, 207, 220);
+const uint16_t COL_TEXT = C(25, 34, 56);
+const uint16_t COL_MUTED = C(107, 118, 140);
+const uint16_t COL_ACCENT = C(245, 130, 20);
+const uint16_t COL_BLUE = C(37, 99, 235);
+const uint16_t COL_CYAN = C(8, 145, 178);
+const uint16_t COL_GREEN = C(22, 163, 74);
+const uint16_t COL_RED = C(220, 38, 38);
 
 bool uiDirty = true;
 
@@ -243,13 +361,13 @@ uint16_t stageColor() {
   switch (stage) {
     case CONVEYOR: return COL_BLUE;
     case SCREW_DOWN: return COL_ACCENT;
-    case SCREW_UP: return COL_CYAN;
+    case SCREW_UP:
+    case RETURN_HOME: return COL_CYAN;
     case DONE: return COL_GREEN;
     default: return COL_ACCENT;
   }
 }
 
-// номер этапа цикла: 0 конвейер, 1 ШВП вниз, 2 ШВП вверх, -1 вне цикла
 int stageIndex() {
   switch (stage) {
     case CONVEYOR: return 0;
@@ -261,9 +379,8 @@ int stageIndex() {
 }
 
 void drawButton(const Btn& b, uint16_t color, const char* label, uint16_t textColor = TFT_WHITE) {
-  tft.fillRoundRect(b.x, b.y + 4, b.w, b.h, 16, C(5, 8, 16));  // тень
+  tft.fillRoundRect(b.x, b.y + 4, b.w, b.h, 16, COL_SHADOW);
   tft.fillRoundRect(b.x, b.y, b.w, b.h, 16, color);
-  tft.drawRoundRect(b.x, b.y, b.w, b.h, 16, C(255, 255, 255));
   tft.setTextColor(textColor);
   tft.setTextDatum(MC_DATUM);
   drawText(label, b.x + b.w / 2, b.y + b.h / 2, &FontRu30);
@@ -274,6 +391,7 @@ float progress() {
     case CONVEYOR: return constrain((millis() - stageStart) / (float)CONVEYOR_LOOP_MS, 0.f, 1.f);
     case SCREW_DOWN:
     case SCREW_UP: return 1.0f - stepsLeft / (float)SCREW_STEPS;
+    case RETURN_HOME: return 1.0f - stepsLeft / (float)homeTotal;
     case DONE: return 1.0f;
     default: return 0.0f;
   }
@@ -286,24 +404,24 @@ void drawProgress() {
   if (filled > 10) tft.fillRoundRect(x, y, filled, h, 5, stageColor());
 }
 
-// Иконка этапа в круге (cx, cy, радиус 44). phase — угол анимации конвейера
 void drawIcon(int cx, int cy, int phase) {
   const int R = 44;
   uint16_t col = stageColor();
   tft.fillCircle(cx, cy, R + 2, COL_CARD);
-  tft.fillCircle(cx, cy, R, C(14, 20, 36));
+  tft.fillCircle(cx, cy, R, COL_ICONBG);
   tft.drawCircle(cx, cy, R, col);
   tft.drawCircle(cx, cy, R - 1, col);
   switch (stage) {
     case CONVEYOR:
-      tft.drawArc(cx, cy, 30, 22, (phase) % 360, (phase + 120) % 360, col, C(14, 20, 36), false);
-      tft.drawArc(cx, cy, 30, 22, (phase + 180) % 360, (phase + 300) % 360, col, C(14, 20, 36), false);
+      tft.drawArc(cx, cy, 30, 22, (phase) % 360, (phase + 120) % 360, col, COL_ICONBG, false);
+      tft.drawArc(cx, cy, 30, 22, (phase + 180) % 360, (phase + 300) % 360, col, COL_ICONBG, false);
       break;
     case SCREW_DOWN:
       tft.fillRect(cx - 7, cy - 26, 14, 28, col);
       tft.fillTriangle(cx - 22, cy, cx + 22, cy, cx, cy + 26, col);
       break;
     case SCREW_UP:
+    case RETURN_HOME:
       tft.fillRect(cx - 7, cy - 2, 14, 28, col);
       tft.fillTriangle(cx - 22, cy, cx + 22, cy, cx, cy - 26, col);
       break;
@@ -313,21 +431,10 @@ void drawIcon(int cx, int cy, int phase) {
         tft.drawLine(cx - 6, cy + 16 + i, cx + 24, cy - 16 + i, col);
       }
       break;
-    default:  // IDLE / WAIT_CONFIRM: «play»
+    default:
       tft.fillTriangle(cx - 12, cy - 22, cx - 12, cy + 22, cx + 24, cy, col);
       break;
   }
-}
-
-void drawStatusDots() {
-  tft.fillRect(270, 8, 206, 40, COL_HEADER);
-  tft.setTextColor(COL_MUTED);
-  tft.setTextDatum(ML_DATUM);
-  bool wifi = WiFi.status() == WL_CONNECTED;
-  tft.fillCircle(290, 28, 7, wifi ? COL_GREEN : COL_RED);
-  drawText("Wi-Fi", 302, 28, &FontRu20);
-  tft.fillCircle(386, 28, 7, mqtt.connected() ? COL_GREEN : COL_RED);
-  drawText("MQTT", 398, 28, &FontRu20);
 }
 
 String cutLabel() {
@@ -340,40 +447,44 @@ String cutLabel() {
 void drawUI() {
   tft.fillScreen(COL_BG);
 
-  // шапка
   tft.fillRect(0, 0, 480, 52, COL_HEADER);
   tft.fillRect(0, 52, 480, 3, COL_ACCENT);
   tft.fillRoundRect(14, 8, 38, 38, 10, COL_ACCENT);
-  tft.setTextColor(COL_BG);
+  tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(MC_DATUM);
   drawText("S", 33, 28, &FontRu30);
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(COL_TEXT);
   tft.setTextDatum(ML_DATUM);
   drawText("SmartCut", 62, 28, &FontRu30);
-  drawStatusDots();
 
-  // карточка этапа
   tft.fillRoundRect(16, 64, 448, 112, 18, COL_CARD);
+  tft.drawRoundRect(16, 64, 448, 112, 18, COL_BORDER);
   drawIcon(78, 120, 0);
 
   const char* title = "";
   switch (stage) {
     case IDLE: title = "Готов к работе"; break;
     case WAIT_CONFIRM: title = "Подтверди старт"; break;
-    case CONVEYOR: title = "Конвейер"; break;
-    case SCREW_DOWN: title = "ШВП вниз"; break;
-    case SCREW_UP: title = "ШВП вверх"; break;
+    case CONVEYOR: title = "Двигаем продукт"; break;
+    case SCREW_DOWN: title = "Продукт нарезается"; break;
+    case SCREW_UP: title = "Возвращаем в исходное"; break;
+    case RETURN_HOME: title = "Подготовка"; break;
     case DONE: title = "Готово!"; break;
   }
-  tft.setTextColor(TFT_WHITE);
+  tft.setFreeFont(&FontRu30);
+  const GFXfont* titleFont = tft.textWidth(title) > 310 ? &FontRu20 : &FontRu30;
+  tft.setTextColor(COL_TEXT);
   tft.setTextDatum(ML_DATUM);
-  drawText(title, 144, 100, &FontRu30);
+  drawText(title, 144, 100, titleFont);
 
   String sub;
   if (stage == IDLE) {
-    sub = "Нажми «Начать нарезку»";
+    if (portalMode && WiFi.status() != WL_CONNECTED) sub = "Wi-Fi: сеть SmartCut-Setup";
+    else sub = detectedProduct.length() ? "На ленте: " + detectedProduct : "Нажми «Начать нарезку»";
   } else if (stage == DONE) {
     sub = "Нарезка завершена";
+  } else if (stage == RETURN_HOME) {
+    sub = "Возвращаем в исходное состояние";
   } else if (stepCut.length()) {
     sub = stepProduct.length() ? stepProduct + " · " + cutLabel() : cutLabel();
     if (stepGrams > 0) sub += " · " + String(stepGrams) + " г";
@@ -383,17 +494,28 @@ void drawUI() {
   tft.setTextColor(COL_MUTED);
   drawText(sub, 144, 140, &FontRu20);
 
-  // этапы цикла
-  const char* names[3] = {"Конвейер", "ШВП вниз", "ШВП вверх"};
+#if MANUAL_JOG
+  if (stage == IDLE) {
+    drawButton(btnUp, COL_BLUE, "Вверх");
+    drawButton(btnDown, COL_ACCENT, "Вниз");
+  }
+#endif
+  const char* names[3] = {"Подача", "Нарезка", "Возврат"};
   int cur = stageIndex();
   for (int i = 0; i < 3; i++) {
+#if MANUAL_JOG
+    if (stage == IDLE) break;
+#endif
     int x = 16 + i * 152;
-    uint16_t bg = cur > i ? C(22, 101, 52) : (cur == i ? stageColor() : COL_PILL);
+    uint16_t bg = cur > i ? COL_GREEN : (cur == i ? stageColor() : COL_PILL);
     tft.fillRoundRect(x, 184, 144, 26, 13, bg);
     tft.setTextColor(cur >= i ? TFT_WHITE : COL_MUTED);
     tft.setTextDatum(MC_DATUM);
     drawText(names[i], x + 72, 197, &FontRu20);
   }
+#if MANUAL_JOG
+  if (stage != IDLE)
+#endif
   drawProgress();
 
   bool run = !canStart() && stage != DONE;
@@ -411,7 +533,7 @@ void animateIcon() {
   drawIcon(78, 120, (millis() / 6) % 360);
 }
 
-// ---------------- Управление циклом ----------------
+// Управление циклом
 void setStage(Stage s) {
   stage = s;
   stageStart = millis();
@@ -419,40 +541,66 @@ void setStage(Stage s) {
   publishStatus();
 }
 
+#if MANUAL_JOG
+void stopJog();
+#endif
+
 void startCycle() {
   if (!canStart()) return;
+  if (screwPos > 0) {
+    homeTotal = screwPos + HOME_MARGIN_STEPS;
+    savePos(true);
+    startMove(-SCREW_DOWN_DIR, homeTotal);
+    setStage(RETURN_HOME);
+    return;
+  }
   conveyorOn();
   setStage(CONVEYOR);
 }
 
 void stopAll() {
+#if MANUAL_JOG
+  stopJog();
+#endif
+  Stage was = stage;
   conveyorOff();
   stepsLeft = 0;
   releaseScrew();
+  if (was == SCREW_DOWN || was == SCREW_UP || was == RETURN_HOME) savePos(false);
   stepProduct = ""; stepCut = ""; stepGrams = -1;
   setStage(IDLE);
 }
 
 void tickCycle() {
   switch (stage) {
+    case RETURN_HOME:
+      if (stepsLeft <= 0) {
+        screwPos = 0;
+        releaseScrew();
+        savePos(false);
+        conveyorOn();
+        setStage(CONVEYOR);
+      }
+      break;
     case CONVEYOR:
       if (millis() - stageStart >= CONVEYOR_LOOP_MS) {
         conveyorOff();
-        screwDir = SCREW_DOWN_DIR;
-        stepsLeft = SCREW_STEPS;
+        savePos(true);
+        startMove(SCREW_DOWN_DIR, SCREW_STEPS);
         setStage(SCREW_DOWN);
       }
       break;
     case SCREW_DOWN:
       if (stepsLeft <= 0) {
-        screwDir = -SCREW_DOWN_DIR;
-        stepsLeft = SCREW_STEPS;
+        startMove(-SCREW_DOWN_DIR, SCREW_STEPS);
         setStage(SCREW_UP);
       }
       break;
     case SCREW_UP:
       if (stepsLeft <= 0) {
         releaseScrew();
+        screwPos = 0;
+        savePos(false);
         setStage(DONE);
       }
       break;
@@ -466,22 +614,75 @@ void tickCycle() {
   }
 }
 
+#if MANUAL_JOG
+// ручное движение: нажал — едет, нажал ещё раз — стоп
+bool jogging = false;
+int jogWant = 0;
+
+void stopJog() {
+  if (!jogging) return;
+  jogging = false;
+  stepsLeft = 0;
+  releaseScrew();
+  savePos(false);
+}
+
+void updateJog(bool touched, uint16_t x, uint16_t y) {
+  static uint32_t lastTouchMs = 0;
+  static bool wasTouched = false;
+  auto in = [&](const Btn& b) { return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; };
+
+  if (jogging && (stage != IDLE || stepsLeft <= 0)) stopJog();
+
+  bool press = touched && !wasTouched && millis() - lastTouchMs > 150;
+  if (touched) lastTouchMs = millis();
+  wasTouched = touched;
+  if (!press || stage != IDLE) return;
+
+  int dir = 0;
+  if (in(btnUp)) dir = -SCREW_DOWN_DIR;
+  else if (in(btnDown)) dir = SCREW_DOWN_DIR;
+  if (dir == 0) return;
+
+  if (jogging && screwDir == dir) {
+    stopJog();
+    return;
+  }
+  savePos(true);
+  startMove(dir, 100000000L);
+  jogging = true;
+}
+#endif
+
 void handleTouch() {
   static uint32_t lastPoll = 0, lastPress = 0;
   if (millis() - lastPoll < 30) return;
   lastPoll = millis();
   uint16_t x, y;
-  if (!getTouchXY(&x, &y) || millis() - lastPress < 400) return;
+  bool touched = getTouchXY(&x, &y);
+#if MANUAL_JOG
+  updateJog(touched, x, y);
+#endif
+  if (!touched || millis() - lastPress < 400) return;
   lastPress = millis();
-  Serial.printf("TOUCH x=%u y=%u\n", x, y);
   auto hit = [&](const Btn& b) { return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; };
   if (hit(btnStop)) stopAll();
   else if (hit(btnStart)) startCycle();
 }
 
-// ---------------- MQTT ----------------
+// MQTT
 void onMessage(char* topic, byte* payload, unsigned int len) {
   JsonDocument d;
+  if (String(topic) == topicProduct) {
+    String name;
+    if (!deserializeJson(d, payload, len)) name = (const char*)(d["product"] | "");
+    if (name.equalsIgnoreCase("none")) name = "";
+    if (name != detectedProduct) {
+      detectedProduct = name;
+      if (stage == IDLE) uiDirty = true;
+    }
+    return;
+  }
   if (deserializeJson(d, payload, len)) return;
   String action = d["action"] | "";
   if (action == "recipe_step") {
@@ -500,7 +701,6 @@ void onMessage(char* topic, byte* payload, unsigned int len) {
 }
 
 void networkTick() {
-  static uint32_t lastDots = 0;
   if (mqtt.connected()) {
     mqtt.loop();
     if (millis() - lastStatus > 5000) publishStatus();
@@ -508,17 +708,13 @@ void networkTick() {
     lastMqttTry = millis();
     if (mqtt.connect(("smartcut-esp-" + String((uint32_t)ESP.getEfuseMac(), HEX)).c_str())) {
       mqtt.subscribe(topicCmd.c_str());
+      mqtt.subscribe(topicProduct.c_str());
       publishStatus();
-      uiDirty = true;
     }
-  }
-  if (millis() - lastDots > 2000) {
-    lastDots = millis();
-    if (canStart()) drawStatusDots();
   }
 }
 
-// ---------------- setup / loop ----------------
+// setup / loop
 void setup() {
   Serial.begin(115200);
   const int outs[] = {IN1, IN2, IN3, IN4, ST1, ST2, ST3, ST4};
@@ -529,6 +725,9 @@ void setup() {
   ledcAttachPin(ENB, 1);
   conveyorOff();
   releaseScrew();
+  loadPos();
+  const esp_timer_create_args_t timerArgs = {.callback = &onStepTimer, .name = "step"};
+  esp_timer_create(&timerArgs, &stepTimer);
 
   tft.init();
   tft.setRotation(1);
@@ -538,24 +737,52 @@ void setup() {
   pinMode(T_DO, INPUT);
   digitalWrite(T_CS, HIGH);
   digitalWrite(T_CLK, LOW);
-  calibrateTouch();
+  // калибровка запоминается; чтобы повторить, держите палец на экране при включении
+  tft.fillScreen(tft.color565(238, 242, 248));
+  tft.setTextColor(tft.color565(25, 34, 56));
+  tft.setTextDatum(MC_DATUM);
+  drawText("SmartCut", 240, 130);
+  drawText("Удерживай экран для калибровки", 240, 180, &FontRu20);
+  bool held = false;
+  uint32_t tb = millis();
+  uint16_t hx, hy;
+  while (millis() - tb < 1800) {
+    if (readRaw(&hx, &hy)) { held = true; break; }
+  }
+  if (held || !loadCal()) calibrateTouch();
 
   String id = DEVICE_ID;
   String base = id.length() ? "smartcut/" + id : "smartcut";
   topicCmd = base + "/cmd";
   topicStatus = base + "/status";
+  topicProduct = base + "/product";
   WiFi.mode(WIFI_STA);
-  if (strlen(WIFI_SSID)) WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (strlen(WIFI_SSID)) {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  } else {
+    portalMode = true;
+    wm.setConfigPortalBlocking(false);
+    wm.setConnectTimeout(15);
+  }
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setSocketTimeout(2);
   mqtt.setCallback(onMessage);
 
   drawUI();
+  if (portalMode) wm.autoConnect("SmartCut-Setup");
 }
 
 void loop() {
+  if (portalMode) {
+    wm.process();
+    static bool wasConnected = false;
+    bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected != wasConnected) {
+      wasConnected = connected;
+      if (stage == IDLE) uiDirty = true;
+    }
+  }
   handleTouch();
-  stepMotor();
   tickCycle();
   networkTick();
   if (uiDirty) drawUI();
